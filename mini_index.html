@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Piton</title>
+<style>
+:root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: #05080a; overflow: hidden; }
+canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+#stars { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; }
+#iframe { display: block; width: 100%; height: 100%; border: 0; touch-action: none; background: transparent; position: relative; z-index: 1; }
+</style>
+</head>
+<body>
+<canvas id="stars"></canvas>
+<iframe id="c" src="/snake.html" style="display:block;width:100%;height:100%;border:0;touch-action:none;background:transparent;"></iframe>
+<script>
+/* ===== Звёздный фон (лёгкий, канвас 2D, не трогает модель) ===== */
+(function () {
+  const cv = document.getElementById('stars');
+  const ctx = cv.getContext('2d');
+  let W = 0, H = 0, dpr = 1;
+  let stars = [];
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const n = Math.floor((W * H) / 9000);   // плотность: ~1 звезда на 9000px²
+    stars = [];
+    for (let i = 0; i < n; i++) {
+      stars.push({
+        x: Math.random() * W, y: Math.random() * H,
+        r: 0.4 + Math.random() * 1.1,
+        tw: 0.5 + Math.random() * 2.5,     // скорость мерцания
+        ph: Math.random() * Math.PI * 2,
+        hue: Math.random() < 0.15 ? 150 : 0  // редкие зелёные звёзды
+      });
+    }
+  }
+  function frame(t) {
+    ctx.clearRect(0, 0, W, H);
+    for (const s of stars) {
+      const a = 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(t / 1000 * s.tw + s.ph));
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fillStyle = s.hue ? `rgba(120,255,180,${a.toFixed(2)})` : `rgba(200,220,255,${a.toFixed(2)})`;
+      ctx.fill();
+    }
+    requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ===== Piton snake avatar — core: rig (math) + 3 three.js styles + pixel renderer ===== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const vnorm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const vcross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+/* ---------- RIG: одна и та же змея для всех стилей ---------- */
+function makeRig(cfg) {
+  const N = cfg.N, M = 320;
+  const W = { idle: 1, think: 0, talk: 0, happy: 0, sad: 0, shy: 0, surprised: 0 };
+  const look = { x: 0, y: 0 };
+  const pts = []; for (let i = 0; i < M; i++) pts.push([0, 0, 0]);
+  const cum = new Float32Array(M);
+  const segs = []; for (let i = 0; i < N; i++) segs.push({ x: 0, y: 0, z: 0, r: 0, tx: 0, ty: 0, tz: 1, u: i / (N - 1), i });
+  const head = { pos: [0, 0, 0], dir: [0, 0, 1], roll: 0, mouth: 0, blink: 0, squint: 0, gx: 0, gy: 0, tongue: 0, dots: 0, hs: cfg.hs, eyeK: 1, pupilK: 1, droop: 0, blush: 0, tear: 0, bang: 0 };
+  const rig = { cfg, segs, head, W, t: 0 };
+
+  rig.update = function (dt, state, tgt) {
+    rig.t += dt; const t = rig.t, seed = cfg.seed;
+    if (state !== rig.state) { rig.state = state; rig.age = 0; } rig.age += dt; const age = rig.age;
+    const enter = Math.exp(-age * 4), jolt = Math.exp(-age * 5) * Math.sin(age * 26);   // «вспышка» при входе в эмоцию
+    const k = 1 - Math.exp(-dt * 7), kl = 1 - Math.exp(-dt * 9);
+    for (const s in W) W[s] += ((state === s ? 1 : 0) - W[s]) * k;
+    look.x += (tgt.x - look.x) * kl; look.y += (tgt.y - look.y) * kl;
+
+    const pause = 0.25 + 0.75 * smooth((Math.sin(t * 1.4) + 0.6) / 1.2);
+    const speech = Math.pow(Math.abs(Math.sin(t * 8.7)), 0.8) * (0.55 + 0.45 * Math.sin(t * 2.3 + seed)) * pause;
+    const lf = clamp(1 - 0.7 * (W.sad + W.shy) - 0.6 * W.surprised, 0, 1);   // насколько змея всё ещё следит за курсором
+    const dx = W.idle * 0.06 * Math.sin(t * 0.9 + seed) + W.think * 0.30 * Math.sin(t * 1.3) + W.talk * 0.06 * Math.sin(t * 1.1) + W.happy * 0.05 * Math.sin(t * 3)
+      + W.sad * 0.03 * Math.sin(t * 0.5) + W.shy * (-0.10 + 0.04 * Math.sin(t * 2.1)) + W.surprised * 0.015 * Math.sin(t * 30);
+    const dy = W.idle * 0.03 * Math.sin(t * 1.7) + W.think * 0.05 * Math.sin(t * 2.6) + W.talk * (0.03 + 0.045 * Math.sin(t * 7.3)) + W.happy * 0.16 * Math.abs(Math.sin(t * 5.2))
+      + W.sad * (-0.34 + 0.025 * Math.sin(t * 0.7)) + W.shy * (-0.20 + 0.02 * Math.sin(t * 3)) + W.surprised * (0.12 + 0.10 * enter);
+    head.roll = W.think * 0.24 * Math.sin(t * 1.3 + 1.2) + W.happy * 0.30 * Math.sin(t * 9) + W.sad * (-0.12) + W.shy * (0.12 + 0.10 * Math.sin(t * 7)) + W.surprised * 0.10 * jolt;
+    head.gx = clamp(look.x * lf + W.think * 0.5 * Math.sin(t * 1.3) + W.sad * 0.18 * Math.sin(t * 0.6) - W.shy * 0.75, -1, 1);
+    head.gy = clamp(look.y * lf + W.think * 0.75 - W.sad * 0.75 - W.shy * 0.55, -1, 1);
+    head.mouth = clamp(W.talk * speech + W.happy * (0.3 + 0.15 * Math.sin(t * 10)) + W.sad * 0.0 + W.surprised * (0.55 + 0.05 * Math.sin(t * 25)), 0, 1);
+    head.squint = W.happy; head.dots = W.think;
+    head.eyeK = 1 + 0.30 * W.surprised + 0.10 * W.surprised * enter; head.pupilK = 1 - 0.55 * W.surprised;
+    head.droop = clamp(W.sad * 0.85 + W.shy * 0.35, 0, 1);
+    head.blush = clamp(W.shy * (0.85 + 0.15 * Math.sin(t * 4)) + W.happy * 0.2, 0, 1);
+    head.tear = W.sad; head.bang = W.surprised;
+    const bp = (t * 0.36 + seed * 0.37) % 1; head.blink = bp < 0.045 ? Math.sin(bp / 0.045 * Math.PI) : 0;
+    const tp = (t * (0.21 + 0.25 * W.happy) + seed * 0.61) % 1; head.tongue = tp < 0.14 ? Math.sin(tp / 0.14 * Math.PI) : 0;
+
+    const f = vnorm([cfg.f0[0] + look.x * 0.55 * lf + dx * 0.6 - W.shy * 0.95, cfg.f0[1] + look.y * 0.35 * lf - W.sad * 0.45 - W.shy * 0.28 + W.surprised * 0.12, cfg.f0[2] - W.surprised * 0.25]);
+    const Hp = [cfg.head[0] + dx + look.x * 0.12 * lf, cfg.head[1] + dy + look.y * 0.08 * lf, cfg.head[2] - W.surprised * 0.22];
+    head.pos = Hp; head.dir = f;
+
+    // центральная линия: спираль-«клубок» + шея (кривая Безье)
+    const Mc = Math.round(M * cfg.uc), Mn = M - Mc, br = 1 + 0.02 * Math.sin(t * 1.7) - 0.035 * W.shy + 0.035 * W.surprised * enter;
+    for (let i = 0; i < Mc; i++) {
+      const w = i / (Mc - 1), th = cfg.th0 + w * cfg.turns * TAU, r = cfg.coilR * (1 - cfg.taper * w) * br;
+      pts[i][0] = r * Math.cos(th); pts[i][1] = cfg.base + cfg.rise * w; pts[i][2] = r * Math.sin(th);
+    }
+    const a = pts[Mc - 2], b = pts[Mc - 1], S = [b[0], b[1], b[2]];
+    const T = vnorm([b[0] - a[0], 0, b[2] - a[2]]);
+    const P1 = [S[0] + T[0] * cfg.a, S[1] + cfg.c, S[2] + T[2] * cfg.a];
+    const P2 = [Hp[0] - f[0] * cfg.b, Hp[1] - f[1] * cfg.b, Hp[2] - f[2] * cfg.b];
+    for (let i = 1; i <= Mn; i++) {
+      const v = i / Mn, u = 1 - v, p = pts[Mc - 1 + i];
+      for (let c = 0; c < 3; c++) p[c] = u * u * u * S[c] + 3 * u * u * v * P1[c] + 3 * u * v * v * P2[c] + v * v * v * Hp[c];
+    }
+    // равномерная нарезка по длине
+    cum[0] = 0;
+    for (let i = 1; i < M; i++) cum[i] = cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1], pts[i][2] - pts[i - 1][2]);
+    const total = cum[M - 1]; let j = 1;
+    for (let q = 0; q < N; q++) {
+      const target = total * q / (N - 1);
+      while (j < M - 1 && cum[j] < target) j++;
+      const p0 = pts[j - 1], p1 = pts[j], sl = (cum[j] - cum[j - 1]) || 1, ff = clamp((target - cum[j - 1]) / sl, 0, 1);
+      const s = segs[q];
+      s.x = lerp(p0[0], p1[0], ff); s.y = lerp(p0[1], p1[1], ff); s.z = lerp(p0[2], p1[2], ff);
+      s.r = cfg.rMax * cfg.prof(s.u);
+    }
+    for (let q = 0; q < N; q++) {
+      const p = segs[Math.max(0, q - 1)], n = segs[Math.min(N - 1, q + 1)], t3 = vnorm([n.x - p.x, n.y - p.y, n.z - p.z]);
+      segs[q].tx = t3[0]; segs[q].ty = t3[1]; segs[q].tz = t3[2];
+    }
+    return rig;
+  };
+  return rig;
+}
+
+const PROFILE = {
+  slim: u => { const tail = Math.pow(Math.sin(Math.min(u / 0.32, 1) * Math.PI / 2), 0.85); return (0.10 + 0.90 * tail) * (1 - 0.30 * smooth((u - 0.7) / 0.3)); },
+  chubby: u => { const tail = Math.pow(Math.sin(Math.min(u / 0.28, 1) * Math.PI / 2), 0.7); return (0.18 + 0.82 * tail) * (1 - 0.12 * smooth((u - 0.85) / 0.15)); }
+};
+
+const BASE_CFG = { th0: 0.9, turns: 1.9, coilR: 1.0, taper: 0.5, base: 0.05, rise: 0.34, uc: 0.62, a: 0.9, b: 0.9, c: 0.7, head: [0.05, 2.25, 0.1], f0: [0.46, -0.10, 0.88] };
+const CFG = {
+  pixel: Object.assign({}, BASE_CFG, { N: 46, rMax: 0.29, hs: 0.58, seed: 1.7, prof: PROFILE.slim }),
+  low: Object.assign({}, BASE_CFG, { N: 60, rMax: 0.31, hs: 0.5, seed: 3.1, prof: PROFILE.slim }),
+  cute: Object.assign({}, BASE_CFG, { N: 56, rMax: 0.40, hs: 0.74, seed: 5.3, prof: PROFILE.chubby, turns: 1.3, coilR: 0.86, taper: 0.42, rise: 0.30, head: [0.02, 1.95, 0.1], a: 0.7, b: 0.75, c: 0.6 }),
+  neon: Object.assign({}, BASE_CFG, { N: 64, rMax: 0.31, hs: 0.6, seed: 7.9, prof: PROFILE.slim, turns: 2.0, coilR: 1.05 })
+};
+
+/* ---------- общие куски для three.js ---------- */
+function shadowBlob(T, size, alpha) {
+  const c = (typeof document !== 'undefined') ? document.createElement('canvas') : null;
+  if (!c) return null;
+  c.width = c.height = 64; const g = c.getContext('2d');
+  const gr = g.createRadialGradient(32, 32, 2, 32, 32, 32);
+  gr.addColorStop(0, 'rgba(0,0,0,' + alpha + ')'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  const m = new T.Mesh(new T.PlaneGeometry(size, size), new T.MeshBasicMaterial({ map: new T.CanvasTexture(c), transparent: true, depthWrite: false }));
+  m.rotation.x = -Math.PI / 2; m.position.y = 0.002; return m;
+}
+
+function addLights(T, scene, warm) {
+  scene.add(new T.AmbientLight(0xffffff, warm ? 0.62 : 0.5));
+  const d = new T.DirectionalLight(0xffffff, warm ? 0.85 : 0.95); d.position.set(3, 5, 4); scene.add(d);
+  const r = new T.DirectionalLight(0x66ffcc, 0.45); r.position.set(-4, 2, -3); scene.add(r);
+}
+
+/* голова: череп + подвижная челюсть + глаза + язык (для «твёрдых» стилей и неона) */
+function buildHead(T, o) {
+  const hs = o.hs, g = new T.Group(), M = o.mats;
+  const skull = new T.Mesh(o.skullGeo, M.body); skull.scale.set(o.sk[0] * hs, o.sk[1] * hs, o.sk[2] * hs); skull.position.y = 0.10 * hs; g.add(skull);
+  if (o.inner) { const inn = new T.Mesh(o.skullGeo, o.inner); inn.scale.copy(skull.scale).multiplyScalar(0.96); inn.position.copy(skull.position); g.add(inn); }
+  const mouth = new T.Mesh(o.smoothGeo, M.mouth); mouth.userData.base = [0.58 * hs, 0.20 * hs, 0.62 * hs]; mouth.position.set(0, -0.30 * hs, 0.42 * hs); g.add(mouth);
+  const jawPivot = new T.Group(); jawPivot.position.set(0, -0.32 * hs, 0.02 * hs); g.add(jawPivot);
+  const jaw = new T.Mesh(o.jawGeo, M.jaw); const jw = o.jw || [0.74, 0.24, 0.95], jz = o.jz || 0.42; jaw.scale.set(jw[0] * hs, jw[1] * hs, jw[2] * hs); jaw.position.set(0, -0.06 * hs, jz * hs); jawPivot.add(jaw);
+  if (o.innerJaw) { const ij = new T.Mesh(o.jawGeo, o.innerJaw); ij.scale.copy(jaw.scale).multiplyScalar(0.94); ij.position.copy(jaw.position); jawPivot.add(ij); }
+
+  if (o.outline) for (const [geo, mesh] of [[o.skullGeo, skull]]) { const ol = new T.Mesh(geo, o.outline); ol.position.copy(mesh.position); ol.scale.copy(mesh.scale).multiplyScalar(1.07); g.add(ol); }
+  const eyes = [], pupils = [];
+  for (const sx of [-1, 1]) {
+    const eg = new T.Group(); eg.position.set(sx * o.eye[0] * hs, o.eye[1] * hs, o.eye[2] * hs);
+    let ball, pupil;
+    if (o.visor) {
+      ball = new T.Mesh(new T.BoxGeometry(1, 1, 0.5), M.eye); ball.scale.set(o.eyeR * hs * 1.5, o.eyeR * hs * 0.9, o.eyeR * hs * 0.5); eg.add(ball);
+      pupil = new T.Group();
+    } else {
+      ball = new T.Mesh(o.smoothGeo, M.eye); ball.scale.setScalar(o.eyeR * hs); eg.add(ball);
+      pupil = new T.Mesh(o.smoothGeo, M.pupil); const ps = o.pupilScale || [1, 1, 1]; pupil.scale.set(o.pupilR * hs * ps[0], o.pupilR * hs * ps[1], o.pupilR * hs * ps[2]); pupil.position.z = o.eyeR * hs * (o.pupilZ || 0.62); eg.add(pupil);
+      if (o.shine) { const sh = new T.Mesh(o.smoothGeo, M.eye); sh.scale.setScalar(o.pupilR * hs * 0.36); sh.position.set(0.22 * o.pupilR * hs, 0.28 * o.pupilR * hs, o.pupilR * hs * 0.82); pupil.add(sh); }
+    }
+    const lid = new T.Mesh(new T.TorusGeometry(0.62, 0.17, 6, 14, Math.PI), M.lid || M.pupil); lid.scale.setScalar((o.eyeR || 0.25) * hs * (o.visor ? 1.2 : 1)); lid.position.z = (o.eyeR || 0.25) * hs * 0.4; lid.visible = false; eg.add(lid);
+    eg.userData = { ball, base: ball.scale.clone(), pupil, pz: pupil.position.z, lid };
+    g.add(eg); eyes.push(eg);
+  }
+  if (o.blush) for (const sx of [-1, 1]) {
+    const b = new T.Mesh(new T.CircleGeometry(0.16 * hs, 14), o.blush); b.position.set(sx * 0.72 * hs, -0.06 * hs, 0.62 * hs); b.rotation.y = sx * 0.9; g.add(b);
+  }
+  const tongue = new T.Group(); tongue.position.set(0, -0.20 * hs, 1.14 * hs);
+  const stem = new T.Mesh(new T.BoxGeometry(0.06 * hs, 0.035 * hs, 1).translate(0, 0, 0.5), M.tongue); tongue.add(stem);
+  for (const sx of [-1, 1]) { const pr = new T.Mesh(new T.BoxGeometry(0.035 * hs, 0.03 * hs, 0.34 * hs).translate(0, 0, 0.17 * hs), M.tongue); pr.position.z = 1; pr.rotation.y = sx * 0.55; tongue.add(pr); }
+  g.add(tongue);
+  return { group: g, jawPivot, mouth, eyes, tongue, hs, jawMax: o.jawMax || 0.55, gazeK: o.gazeK || 0.10 };
+}
+
+function poseHead(T, H, rig, tmp) {
+  const h = rig.head, g = H.group;
+  g.position.set(h.pos[0] + h.dir[0] * H.hs * 0.22, h.pos[1] + h.dir[1] * H.hs * 0.22, h.pos[2] + h.dir[2] * H.hs * 0.22);
+  tmp.set(g.position.x + h.dir[0], g.position.y + h.dir[1], g.position.z + h.dir[2]);
+  g.lookAt(tmp); g.rotateZ(h.roll);
+  H.jawPivot.rotation.x = h.mouth * H.jawMax;
+  const sq = h.squint > 0.5, closed = clamp(Math.max(h.blink, sq ? 1 : 0), 0, 1);
+  for (const e of H.eyes) {
+    const u = e.userData;
+    u.ball.visible = !sq; u.lid.visible = sq;
+    e.scale.setScalar(h.eyeK); e.rotation.z = (e.position.x < 0 ? 1 : -1) * 0.42 * h.droop;
+    u.ball.scale.set(u.base.x, u.base.y * (1 - 0.9 * h.blink) * (1 - 0.52 * h.droop), u.base.z);
+    u.pupil.position.set(h.gx * H.gazeK * H.hs, h.gy * H.gazeK * H.hs, u.pz);
+    u.pupil.visible = !sq && h.blink < 0.6;
+  }
+  const mb = H.mouth.userData.base; H.mouth.visible = h.mouth > 0.05;
+  H.mouth.scale.set(mb[0], mb[1] * (0.3 + h.mouth * 1.2), mb[2]); H.mouth.position.y = -0.30 * H.hs - h.mouth * 0.06 * H.hs;
+  const tl = h.tongue * H.hs * 0.62; H.tongue.visible = tl > 0.01; H.tongue.scale.set(1, 1, Math.max(tl, 0.001));
+  H.tongue.position.y = -0.20 * H.hs - h.mouth * 0.12 * H.hs;
+  if (H.tears) H.tears.forEach((m, i) => {
+    const ph = (rig.t * 0.55 + i * 0.4) % 1, on = h.tear > 0.25; m.visible = on;
+    if (on) { m.position.set((i ? 1 : -1) * 0.72 * H.hs, 0.02 * H.hs - ph * 1.15 * H.hs, 0.42 * H.hs); m.scale.set(0.13 * H.hs, 0.20 * H.hs * (0.7 + 0.6 * ph), 0.13 * H.hs); if (H.sprite) { m.scale.multiplyScalar(1 - 0.55 * ph); m.material.opacity = 1; } else m.material.opacity = h.tear * (1 - ph * 0.85); }
+  });
+  if (H.blushes) H.blushes.forEach(b => { b.visible = h.blush > 0.05; b.material.opacity = H.sprite ? 1 : clamp(h.blush, 0, 1) * 0.95; });
+}
+
+function addEmotionProps(T, H, sprite) {
+  const hs = H.hs; H.sprite = !!sprite;
+  H.tears = [0, 1].map(() => { const m = new T.Mesh(new T.SphereGeometry(1, 8, 6), new T.MeshBasicMaterial({ color: 0x9dfcff, transparent: true, depthWrite: false, depthTest: false })); m.visible = false; m.renderOrder = 10; H.group.add(m); return m; });
+  H.blushes = [-1, 1].map(sx => {
+    const b = new T.Mesh(new T.CircleGeometry(0.36 * hs, 20), new T.MeshBasicMaterial({ color: 0xff2f92, transparent: true, opacity: 0, depthWrite: false, side: T.DoubleSide, blending: sprite ? T.NormalBlending : T.AdditiveBlending }));
+    b.position.set(sx * 0.66 * hs, -0.04 * hs, 0.18 * hs); b.rotation.y = sx * (Math.PI / 2 - 0.45); b.renderOrder = 9; b.visible = false; H.group.add(b); return b;
+  });
+}
+function buildBang(T, color) {
+  const g = new T.Group(), m = new T.MeshBasicMaterial({ color });
+  const bar = new T.Mesh(new T.BoxGeometry(0.10, 0.36, 0.05), m); bar.position.y = 0.16; g.add(bar);
+  const dot = new T.Mesh(new T.BoxGeometry(0.10, 0.10, 0.05), m); dot.position.y = -0.14; g.add(dot);
+  const halo = new T.Mesh(new T.RingGeometry(0.34, 0.37, 28), new T.MeshBasicMaterial({ color, transparent: true, opacity: 0.55, side: T.DoubleSide })); g.add(halo);
+  g.visible = false; return g;
+}
+function poseBang(H, bang, rig) {
+  const h = rig.head; bang.visible = h.bang > 0.05;
+  if (!bang.visible) return;
+  bang.position.set(h.pos[0] + H.hs * 1.55 + 0.1, h.pos[1] + H.hs * 0.95 + 0.05 * Math.sin(rig.t * 14) * h.bang, h.pos[2] + 0.35);
+  bang.scale.setScalar(h.bang * (1 + 0.10 * Math.sin(rig.t * 14)) * (0.8 + 0.5 * H.hs));
+}
+
+function buildDots(T, color) {
+  const g = new T.Group(), m = new T.MeshBasicMaterial({ color });
+  const geo = new T.SphereGeometry(1, 10, 8);
+  for (let i = 0; i < 3; i++) { const s = new T.Mesh(geo, m); g.add(s); }
+  return g;
+}
+function poseDots(H, dots, rig) {
+  const h = rig.head, t = rig.t;
+  dots.visible = h.dots > 0.03;
+  dots.children.forEach((s, i) => {
+    s.position.set(h.pos[0] + (i - 1) * 0.30 * (H.hs / 0.44 * 0.6 + 0.4), h.pos[1] + H.hs * 1.55 + 0.05 * Math.sin(t * 6 - i * 0.9), h.pos[2] + 0.3);
+    s.scale.setScalar((0.055 + 0.03 * Math.sin(t * 6 - i * 0.9)) * (0.6 + 0.4 * (H.hs / 0.44)) * h.dots);
+  });
+}
+
+function writeSpheres(mesh, rig, dummy, mul) {
+  const S = rig.segs;
+  for (let i = 0; i < S.length; i++) {
+    dummy.position.set(S[i].x, S[i].y, S[i].z); dummy.scale.setScalar(S[i].r * (mul || 1)); dummy.rotation.set(0, 0, 0); dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+}
+
+/* ---------- СТИЛЬ 2: low-poly ---------- */
+function buildLowPoly(T) {
+  const rig = makeRig(CFG.low), N = CFG.low.N;
+  const scene = new T.Scene(), camera = new T.PerspectiveCamera(30, 4 / 5, 0.1, 100);
+  camera.position.set(0, 2.9, 8.6); camera.lookAt(0, 1.2, 0);
+  addLights(T, scene, false);
+  const mat = new T.MeshStandardMaterial({ color: 0xffffff, flatShading: true, roughness: 0.78, metalness: 0.0 });
+  const mesh = new T.InstancedMesh(new T.SphereGeometry(1, 7, 5), mat, N); mesh.frustumCulled = false; scene.add(mesh);
+  const A = new T.Color(0x37d466), B = new T.Color(0x1c9c4a), C = new T.Color(0x0f6d33), tmpc = new T.Color();
+  for (let i = 0; i < N; i++) {
+    const u = i / (N - 1);
+    tmpc.copy(Math.floor(i / 3) % 2 ? A : B).lerp(C, (1 - u) * 0.55);
+    mesh.setColorAt(i, tmpc);
+  }
+  mesh.instanceColor.needsUpdate = true;
+  const sh = shadowBlob(T, 4.6, 0.5); if (sh) scene.add(sh);
+  const ico = new T.IcosahedronGeometry(1, 1), smooth7 = new T.SphereGeometry(1, 8, 6);
+  const H = buildHead(T, {
+    hs: CFG.low.hs, skullGeo: ico, jawGeo: ico, smoothGeo: smooth7, sk: [0.98, 0.62, 1.22], eye: [0.50, 0.32, 0.62], eyeR: 0.23, pupilR: 0.12, gazeK: 0.07,
+    mats: {
+      body: new T.MeshStandardMaterial({ color: 0x43e070, flatShading: true, roughness: 0.7 }), jaw: new T.MeshStandardMaterial({ color: 0x8fdca0, flatShading: true, roughness: 0.8 }), lid: new T.MeshBasicMaterial({ color: 0x0a2a14 }),
+      eye: new T.MeshStandardMaterial({ color: 0xfdfdf0, flatShading: true, roughness: 0.5 }), pupil: new T.MeshBasicMaterial({ color: 0x0a1a10 }),
+      mouth: new T.MeshBasicMaterial({ color: 0x4a0d1c }), tongue: new T.MeshBasicMaterial({ color: 0xff4d6d })
+    }
+  });
+  scene.add(H.group);
+  const dots = buildDots(T, 0x9dffc4); scene.add(dots);
+  const dummy = new T.Object3D(), tmp = new T.Vector3();
+  return { rig, scene, camera, update() { writeSpheres(mesh, rig, dummy); poseHead(T, H, rig, tmp); poseDots(H, dots, rig); } };
+}
+
+/* ---------- СТИЛЬ 3: милый мультяшный маскот ---------- */
+function buildCute(T) {
+  const cfg = CFG.cute, rig = makeRig(cfg), N = cfg.N;
+  const scene = new T.Scene(), camera = new T.PerspectiveCamera(30, 4 / 5, 0.1, 100);
+  camera.position.set(0, 2.5, 7.4); camera.lookAt(0, 1.05, 0);
+  scene.add(new T.AmbientLight(0xffffff, 0.32));
+  const kd = new T.DirectionalLight(0xffffff, 0.78); kd.position.set(3, 5, 4); scene.add(kd);
+  const kr = new T.DirectionalLight(0xbfffe0, 0.22); kr.position.set(-4, 2, -3); scene.add(kr);
+  const tone = new Uint8Array([95, 160, 215, 255]);
+  const grad = new T.DataTexture(tone, tone.length, 1, T.LuminanceFormat); grad.minFilter = grad.magFilter = T.NearestFilter; grad.needsUpdate = true;
+  const toon = c => new T.MeshToonMaterial({ color: c, gradientMap: grad });
+  const mesh = new T.InstancedMesh(new T.SphereGeometry(1, 20, 14), new T.MeshToonMaterial({ color: 0xffffff, gradientMap: grad }), N); mesh.frustumCulled = false; scene.add(mesh);
+  const A = new T.Color(0x4fcf3f), B = new T.Color(0x3aae35), tmpc = new T.Color();
+  for (let i = 0; i < N; i++) { tmpc.copy(Math.floor(i / 4) % 2 ? A : B); mesh.setColorAt(i, tmpc); }
+  const outMat = new T.MeshBasicMaterial({ color: 0x12461a, side: T.BackSide });
+  const outline = new T.InstancedMesh(new T.SphereGeometry(1, 20, 14), outMat, N); outline.frustumCulled = false; scene.add(outline);
+  mesh.instanceColor.needsUpdate = true;
+  const sh = shadowBlob(T, 4.2, 0.42); if (sh) scene.add(sh);
+  const round = new T.SphereGeometry(1, 26, 18);
+  const H = buildHead(T, {
+    hs: cfg.hs, skullGeo: round, jawGeo: round, smoothGeo: round, sk: [1.0, 0.86, 1.04], eye: [0.42, 0.50, 0.72], eyeR: 0.30, pupilR: 0.19, shine: true, gazeK: 0.11, jawMax: 0.5, outline: outMat, jw: [0.66, 0.24, 0.62], jz: 0.36,
+    blush: new T.MeshBasicMaterial({ color: 0xff8fa3, transparent: true, opacity: 0.75 }),
+    mats: { body: toon(0x4fcf3f), jaw: toon(0xd5f2a0), lid: new T.MeshBasicMaterial({ color: 0x12301a }), eye: new T.MeshBasicMaterial({ color: 0xffffff }), pupil: new T.MeshBasicMaterial({ color: 0x14210f }), mouth: new T.MeshBasicMaterial({ color: 0x8a1c3a }), tongue: new T.MeshBasicMaterial({ color: 0xff5c8a }) }
+  });
+  scene.add(H.group);
+  // пятнышки на спине
+  const spotGeo = new T.SphereGeometry(1, 10, 8), spotMat = toon(0x1f7d2c), spots = [];
+  for (let i = 0; i < 9; i++) { const s = new T.Mesh(spotGeo, spotMat); scene.add(s); spots.push(s); }
+  const dots = buildDots(T, 0xfff3a0); scene.add(dots);
+  const dummy = new T.Object3D(), tmp = new T.Vector3();
+  return {
+    rig, scene, camera, update() {
+      writeSpheres(mesh, rig, dummy); writeSpheres(outline, rig, dummy, 1.09); poseHead(T, H, rig, tmp); poseDots(H, dots, rig);
+      spots.forEach((s, k) => { const q = rig.segs[6 + k * 5 > N - 8 ? N - 8 : 6 + k * 5]; s.position.set(q.x, q.y + q.r * 0.86, q.z); s.scale.set(q.r * 0.42, q.r * 0.18, q.r * 0.42); });
+    }
+  };
+}
+
+/* ---------- СТИЛЬ 4: неон / киберпанк ---------- */
+const NEON_OPTS = { pupil: 'slit' };
+
+function shapedGeo(T, detail, fn) {           // икосаэдр, вершины которого смещены функцией fn(x,y,z)->[x,y,z]
+  const g = new T.IcosahedronGeometry(1, detail), p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) { const r = fn(p.getX(i), p.getY(i), p.getZ(i)); p.setXYZ(i, r[0], r[1], r[2]); }
+  g.computeVertexNormals(); return g;
+}
+function wedgeGeo(T, wBack, wFront, hBack, hFront, len, detail) {   // клин: широкий затылок, узкая морда
+  return shapedGeo(T, detail, (x, y, z) => { const zt = (z + 1) / 2, k = Math.pow(zt, 0.9); let yy = y * lerp(hBack, hFront, k); if (yy > 0) yy *= 0.8; return [x * lerp(wBack, wFront, k), yy, z * len]; });
+}
+
+function neonHead(T, kind, hs, sprite) {
+  const smooth = new T.SphereGeometry(1, 14, 10), ico = new T.IcosahedronGeometry(1, 1);
+  const wire = c => new T.MeshBasicMaterial({ color: c, wireframe: true }), solid = c => new T.MeshBasicMaterial({ color: c });
+  const base = {
+    hs, smoothGeo: smooth, eyeR: 0.30, pupilR: 0.19, pupilScale: [0.42, 1.05, 0.55], pupilZ: 0.86, shine: true, gazeK: 0.075, jawMax: 0.5,
+    mats: { body: wire(0x00ff9d), jaw: wire(0x18b6ff), lid: solid(0xe6ff5c), eye: solid(0xe6ff5c), pupil: solid(0x000000), mouth: solid(0xff2d6f), tongue: solid(0xff2d6f) }
+  };
+  const inner = solid(0x03150d);
+  let o, extra = null;
+  if (kind === 'wedge') {
+    const sk = wedgeGeo(T, 1.15, 0.40, 0.78, 0.42, 1.38, 2), jw = wedgeGeo(T, 0.95, 0.34, 0.5, 0.3, 1.25, 1);
+    o = Object.assign({}, base, { skullGeo: sk, jawGeo: jw, sk: [1, 1, 1], jw: [0.84, 0.44, 0.78], jz: 0.36, eye: [0.52, 0.30, 0.40], eyeR: 0.30, inner, innerJaw: inner });
+  } else if (kind === 'cobra') {
+    o = Object.assign({}, base, { skullGeo: ico, jawGeo: ico, sk: [0.86, 0.62, 1.12], eye: [0.44, 0.30, 0.74], eyeR: 0.29, inner, innerJaw: inner });
+    extra = (H) => {
+      const hood = new T.Group(); hood.position.set(0, -0.30 * hs, -0.66 * hs);
+      const disc = new T.Mesh(new T.CircleGeometry(1, 40), new T.MeshBasicMaterial({ color: 0x04150d, side: T.DoubleSide })); disc.scale.set(1.12 * hs, 1.5 * hs, 1); hood.add(disc);
+      const rim = new T.Mesh(new T.RingGeometry(0.92, 1.0, 44), new T.MeshBasicMaterial({ color: 0x00ff9d, side: T.DoubleSide })); rim.scale.copy(disc.scale); rim.position.z = 0.004; hood.add(rim);
+      const rim2 = new T.Mesh(new T.RingGeometry(0.66, 0.70, 44), new T.MeshBasicMaterial({ color: 0x18b6ff, side: T.DoubleSide })); rim2.scale.copy(disc.scale); rim2.position.z = 0.006; hood.add(rim2);
+      const rim3 = new T.Mesh(new T.RingGeometry(0.38, 0.41, 44), new T.MeshBasicMaterial({ color: 0x00ff9d, side: T.DoubleSide })); rim3.scale.copy(disc.scale); rim3.position.z = 0.008; hood.add(rim3);
+      H.group.add(hood); H.hood = hood;
+    };
+  } else { // rings — голова из таких же колец, как тело
+    o = Object.assign({}, base, { skullGeo: smooth, jawGeo: smooth, sk: [0.98, 0.62, 1.22], eye: [0.5, 0.32, 0.86], eyeR: 0.29 });
+    o.mats = Object.assign({}, base.mats, { body: solid(0x04180f), jaw: solid(0x04141f) });
+    extra = (H) => {
+      const rgeo = new T.TorusGeometry(1, 0.10, 6, 26), c1 = new T.Color(0x18b6ff), c2 = new T.Color(0x00ff9d);
+      const ring = (grp, cx, cy, cz, ax, ay, col) => { const m = new T.Mesh(rgeo, new T.MeshBasicMaterial({ color: col })); m.position.set(cx, cy, cz); m.scale.set(ax, ay, ax); grp.add(m); };
+      const A = 0.98 * hs, B = 0.62 * hs, Cz = 1.22 * hs;
+      for (let k = 0; k < 9; k++) { const zt = -0.86 + k * 0.215, sc = Math.sqrt(Math.max(0.02, 1 - zt * zt)); ring(H.group, 0, 0.10 * hs, zt * Cz, A * sc * 1.01, B * sc * 1.01, new T.Color().copy(c1).lerp(c2, k / 8)); }
+      for (let k = 0; k < 4; k++) { const zt = -0.7 + k * 0.42, sc = Math.sqrt(Math.max(0.02, 1 - zt * zt)); ring(H.jawPivot, 0, -0.06 * hs, 0.42 * hs + zt * 0.95 * hs, 0.74 * hs * sc * 1.02, 0.24 * hs * sc * 1.02, 0x18b6ff); }
+    };
+  }
+  const H = buildHead(T, o);
+  if (extra) extra(H);
+  addEmotionProps(T, H, sprite);
+  return H;
+}
+
+function buildNeon(T, kind, opts) {
+  opts = opts || {};
+  const cfg = CFG.neon, rig = makeRig(cfg), N = cfg.N;
+  const scene = new T.Scene(), camera = new T.PerspectiveCamera(30, 4 / 5, 0.1, 100);
+  camera.position.set(0, 2.75, 7.5); camera.lookAt(0, 1.4, 0);
+  const core = new T.InstancedMesh(new T.SphereGeometry(1, 10, 8), new T.MeshBasicMaterial({ color: 0x08402a }), N); core.frustumCulled = false; scene.add(core);
+  const mesh = new T.InstancedMesh(new T.TorusGeometry(1, 0.15, 6, 24), new T.MeshBasicMaterial({ color: 0xffffff }), N); mesh.frustumCulled = false; scene.add(mesh);
+  const c1 = new T.Color(0x00ff9d), c2 = new T.Color(0x18b6ff), tmpc = new T.Color();
+  for (let i = 0; i < N; i++) { tmpc.copy(c2).lerp(c1, i / (N - 1)); mesh.setColorAt(i, tmpc); }
+  mesh.instanceColor.needsUpdate = true;
+  // сетка-пол
+  if (!opts.sprite) { const grid = new T.GridHelper(7, 14, 0x00e676, 0x0b5a3a); grid.material.transparent = true; grid.material.opacity = 0.35; grid.position.y = 0; scene.add(grid); }
+  // «ядро» вдоль тела
+  const lg = new T.BufferGeometry(); const lp = new Float32Array(N * 3); lg.setAttribute('position', new T.BufferAttribute(lp, 3));
+  const line = new T.Line(lg, new T.LineBasicMaterial({ color: 0xc8ffe6, transparent: true, opacity: 0.85 })); line.frustumCulled = false; scene.add(line);
+  // «пакеты данных»
+  const pk = [], pkGeo = new T.SphereGeometry(1, 8, 6), pkMat = new T.MeshBasicMaterial({ color: 0xffffff });
+  for (let i = 0; i < 5; i++) { const m = new T.Mesh(pkGeo, pkMat); scene.add(m); pk.push(m); }
+  const H = neonHead(T, kind || 'rings', cfg.hs, !!opts.sprite);
+  scene.add(H.group);
+  const dots = buildDots(T, 0x00ff9d); scene.add(dots);
+  const bang = buildBang(T, 0xffe94d); scene.add(bang);
+  const dummy = new T.Object3D(), tmp = new T.Vector3();
+  return {
+    rig, scene, camera, update() {
+      const S = rig.segs;
+      for (let i = 0; i < N; i++) {
+        dummy.position.set(S[i].x, S[i].y, S[i].z); dummy.scale.setScalar(S[i].r * 1.0);
+        tmp.set(S[i].x + S[i].tx, S[i].y + S[i].ty, S[i].z + S[i].tz); dummy.lookAt(tmp); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix);
+        dummy.scale.setScalar(S[i].r * 0.93); dummy.rotation.set(0, 0, 0); dummy.updateMatrix(); core.setMatrixAt(i, dummy.matrix);
+        dummy.lookAt(tmp);
+        lp[i * 3] = S[i].x; lp[i * 3 + 1] = S[i].y; lp[i * 3 + 2] = S[i].z;
+      }
+      mesh.instanceMatrix.needsUpdate = true; core.instanceMatrix.needsUpdate = true; lg.attributes.position.needsUpdate = true;
+      pk.forEach((m, i) => { const f = ((rig.t * 0.35 + i / pk.length) % 1) * (N - 1), a = Math.floor(f), b = Math.min(N - 1, a + 1), w = f - a; m.position.set(lerp(S[a].x, S[b].x, w), lerp(S[a].y, S[b].y, w) + S[a].r * 0.2, lerp(S[a].z, S[b].z, w)); m.scale.setScalar(0.06); });
+      poseHead(T, H, rig, tmp); poseDots(H, dots, rig); poseBang(H, bang, rig);
+      const pr = H.hs * 0.19 * lerp(1, 0.72, rig.W.surprised), ps = NEON_OPTS.pupil === 'round' ? [0.72, 0.72, 0.6] : [lerp(0.42, 0.85, rig.W.surprised), lerp(1.05, 0.95, rig.W.surprised), 0.55];
+      for (const e of H.eyes) e.userData.pupil.scale.set(pr * ps[0], pr * ps[1], pr * ps[2]);
+      if (H.hood) { const hh = rig.head, k = 1 + 0.08 * hh.mouth + 0.12 * hh.squint + 0.02 * Math.sin(rig.t * 3); H.hood.scale.set(k, k, 1); }
+    }
+  };
+}
+
+/* ---------- СТИЛЬ 1: пиксель-арт (программный растеризатор, без WebGL) ---------- */
+const PIX = (() => {
+  const c = (r, g, b) => ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+  return {
+    bg: c(10, 18, 16), bgDot: c(16, 30, 26), shadow: c(6, 11, 10), out: c(4, 20, 10),
+    green: [c(10, 64, 32), c(20, 108, 52), c(34, 160, 76), c(74, 214, 112), c(190, 250, 205)],
+    belly: [c(80, 120, 70), c(120, 170, 100), c(170, 215, 130), c(214, 240, 160), c(240, 255, 200)],
+    white: c(250, 250, 235), black: c(6, 10, 8), red: c(255, 77, 109), mouth: c(80, 10, 28), dot: c(157, 255, 196)
+  };
+})();
+
+function makePixelRenderer(W, H) {
+  const rig = makeRig(CFG.pixel), N = CFG.pixel.N;
+  const buf = new Uint32Array(W * H), mask = new Uint8Array(W * H);
+  const S = 21, cx = W / 2, by = H * 0.87, phi = 0.30, cp = Math.cos(phi), sp = Math.sin(phi);
+  const L = vnorm([-0.45, 0.55, 0.7]);
+  const proj = (x, y, z) => [cx + x * S, by - (y * cp - z * sp) * S, z * cp + y * sp];
+  const put = (x, y, col) => { x |= 0; y |= 0; if (x < 0 || y < 0 || x >= W || y >= H) return; buf[y * W + x] = col; mask[y * W + x] = 1; };
+  function disc(px, py, rp, pal, dark) {
+    for (let y = Math.floor(py - rp); y <= Math.ceil(py + rp); y++) for (let x = Math.floor(px - rp); x <= Math.ceil(px + rp); x++) {
+      const dx = x + 0.5 - px, dy = y + 0.5 - py, d2 = dx * dx + dy * dy; if (d2 > rp * rp) continue;
+      const nz = Math.sqrt(Math.max(0, 1 - d2 / (rp * rp))), l = (dx / rp) * L[0] + (-dy / rp) * L[1] + nz * L[2];
+      let idx = l < 0.08 ? 0 : l < 0.34 ? 1 : l < 0.62 ? 2 : l < 0.84 ? 3 : 4; idx = Math.max(0, idx - (dark || 0));
+      put(x, y, pal[idx]);
+    }
+  }
+  function render(dt, state, tgt) {
+    rig.update(dt, state, tgt);
+    buf.fill(PIX.bg); mask.fill(0);
+    for (let y = 2; y < H; y += 6) for (let x = 2; x < W; x += 6) buf[y * W + x] = PIX.bgDot;
+    // тень
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const dx = (x - cx) / 27, dy = (y - (by + 1)) / 6.5; if (dx * dx + dy * dy < 1) buf[y * W + x] = PIX.shadow; }
+    const items = [];
+    rig.segs.forEach((s, i) => { const p = proj(s.x, s.y, s.z); items.push({ d: p[2], x: p[0], y: p[1], r: s.r * S * 1.02, band: Math.floor(i / 3) % 2 && i < N - 2 ? 1 : 0, kind: 0 }); });
+    const h = rig.head, hs = h.hs, f = h.dir;
+    // базис головы (с креном)
+    let right = vnorm(vcross([0, 1, 0], f)), up = vcross(f, right);
+    const cr = Math.cos(h.roll), sr = Math.sin(h.roll);
+    const R = [right[0] * cr + up[0] * sr, right[1] * cr + up[1] * sr, right[2] * cr + up[2] * sr], U = [up[0] * cr - right[0] * sr, up[1] * cr - right[1] * sr, up[2] * cr - right[2] * sr];
+    const at = (a, b, c) => [h.pos[0] + f[0] * a + U[0] * b + R[0] * c, h.pos[1] + f[1] * a + U[1] * b + R[1] * c, h.pos[2] + f[2] * a + U[2] * b + R[2] * c];
+    const sk = at(hs * 0.25, hs * 0.05, 0), sn = at(hs * 1.12, -hs * 0.10, 0), jw = at(hs * 1.0, -hs * (0.40 + h.mouth * 0.45), 0), mo = at(hs * 1.05, -hs * (0.26 + h.mouth * 0.2), 0);
+    const P = { sk: proj(sk[0], sk[1], sk[2]), sn: proj(sn[0], sn[1], sn[2]), jw: proj(jw[0], jw[1], jw[2]), mo: proj(mo[0], mo[1], mo[2]) };
+    items.push({ d: P.jw[2] - 0.02, x: P.jw[0], y: P.jw[1], r: hs * S * 0.62, kind: 1, pal: PIX.belly });
+    if (h.mouth > 0.1) items.push({ d: P.mo[2] - 0.01, x: P.mo[0], y: P.mo[1], r: hs * S * (0.34 + h.mouth * 0.18), kind: 2 });
+    items.push({ d: P.sn[2], x: P.sn[0], y: P.sn[1], r: hs * S * 0.64, kind: 1, pal: PIX.green });
+    items.push({ d: P.sk[2] + 0.001, x: P.sk[0], y: P.sk[1], r: hs * S * 0.90, kind: 1, pal: PIX.green });
+    items.sort((a, b) => a.d - b.d);
+    for (const it of items) {
+      if (it.kind === 0) disc(it.x, it.y, it.r, PIX.green, it.band);
+      else if (it.kind === 1) disc(it.x, it.y, it.r, it.pal, 0);
+      else disc(it.x, it.y, it.r, [PIX.mouth, PIX.mouth, PIX.mouth, PIX.mouth, PIX.mouth], 0);
+    }
+    // глаза
+    const closed = Math.max(h.blink, h.squint);
+    for (const sx of [-1, 1]) {
+      const e = at(hs * 0.42, hs * 0.34, sx * hs * 0.56), p = proj(e[0], e[1], e[2]);
+      if (p[2] < P.sk[2] - 0.15) continue; // за головой
+      const ex = Math.round(p[0]), ey = Math.round(p[1]);
+      if (h.squint > 0.5) { put(ex - 2, ey + 1, PIX.black); put(ex - 1, ey, PIX.black); put(ex, ey - 0, PIX.black); put(ex + 1, ey, PIX.black); put(ex + 2, ey + 1, PIX.black); }
+      else if (closed > 0.5) { put(ex - 1, ey, PIX.black); put(ex, ey, PIX.black); put(ex + 1, ey, PIX.black); }
+      else {
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (Math.abs(dx) + Math.abs(dy) < 3) put(ex + dx, ey + dy, PIX.white);
+        put(ex + Math.round(clamp(h.gx, -1, 1) * 0.9), ey + Math.round(-clamp(h.gy, -1, 1) * 0.9), PIX.black);
+      }
+    }
+    // язык
+    if (h.tongue > 0.05) {
+      const tip = at(hs * 1.5, -hs * (0.16 + h.mouth * 0.15), 0), p0 = proj(sn[0], sn[1] - hs * 0.1, sn[2]), p1 = proj(tip[0], tip[1], tip[2]);
+      const len = Math.max(2, Math.round(h.tongue * 6)), vx = p1[0] - p0[0], vy = p1[1] - p0[1], vl = Math.hypot(vx, vy) || 1;
+      for (let i = 0; i <= len; i++) put(p0[0] + vx / vl * (hs * S * 0.5 + i), p0[1] + vy / vl * (hs * S * 0.5 + i) + 1, PIX.red);
+      const ex = p0[0] + vx / vl * (hs * S * 0.5 + len), ey = p0[1] + vy / vl * (hs * S * 0.5 + len) + 1;
+      put(ex + vy / vl * 1.4 + vx / vl, ey - vx / vl * 1.4 + vy / vl, PIX.red); put(ex - vy / vl * 1.4 + vx / vl, ey + vx / vl * 1.4 + vy / vl, PIX.red);
+    }
+    // контур по силуэту
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = y * W + x; if (mask[i]) continue;
+      if ((x > 0 && mask[i - 1] === 1) || (x < W - 1 && mask[i + 1] === 1) || (y > 0 && mask[i - W] === 1) || (y < H - 1 && mask[i + W] === 1)) buf[i] = PIX.out;
+    }
+    // «...» размышлений
+    if (h.dots > 0.05) for (let i = 0; i < 3; i++) {
+      const p = proj(h.pos[0] + (i - 1) * 0.34, h.pos[1] + hs * 1.7 + 0.05 * Math.sin(rig.t * 6 - i * 0.9), h.pos[2] + 0.3), sz = Math.round(1 + 1.4 * (0.5 + 0.5 * Math.sin(rig.t * 6 - i * 0.9)) * h.dots);
+      for (let dy = 0; dy < sz; dy++) for (let dx = 0; dx < sz; dx++) put(p[0] + dx - sz / 2, p[1] + dy - sz / 2, PIX.dot);
+    }
+    return buf;
+  }
+  return { rig, render, W, H };
+}
+
+if (typeof module !== 'undefined') module.exports = { CFG, makeRig, buildLowPoly, buildCute, buildNeon, makePixelRenderer, NEON_OPTS };
+
+
+/* старая inline-змейка отключена — теперь живёт в iframe /snake.html
+(function () {
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+  renderer.setClearColor(0x000000, 0);
+  const s = buildNeon(THREE, 'wedge');
+  const ptr = { x: null, y: null };
+  window.addEventListener('pointermove', e => { ptr.x = e.clientX; ptr.y = e.clientY; }, { passive: true });
+  canvas.addEventListener('pointerdown', () => { poke = performance.now() + 1700; });
+  let poke = 0;
+
+  function fit() {
+    const w = canvas.clientWidth, h = canvas.clientHeight; if (!w || !h) return;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(w, h, false);
+    s.camera.aspect = w / h; s.camera.updateProjectionMatrix();
+  }
+  new ResizeObserver(fit).observe(canvas); fit();
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000)); last = now;
+    if (!document.hidden) {
+      let look;
+      if (ptr.x !== null) {
+        const r = canvas.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height * 0.32;
+        look = { x: Math.max(-1, Math.min(1, (ptr.x - cx) / (r.width * 0.9 || 1))), y: Math.max(-1, Math.min(1, -(ptr.y - cy) / (r.height * 0.8 || 1))) };
+      } else { const t = now / 1000; look = { x: 0.25 * Math.sin(t * 0.4), y: 0.08 * Math.sin(t * 0.31) }; }
+      const st = now < poke ? 'happy' : (window.__emo || 'idle');
+      s.rig.update(dt, st, look); s.update(); renderer.render(s.scene, s.camera);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+*/
+
+</script>
+<div style="position:fixed;bottom:0;left:0;right:0;background:transparent;border-top:1px solid var(--line);padding:8px 12px calc(8px + env(safe-area-inset-bottom));z-index:9999;">
+  <div id="chat" style="max-height:35vh;overflow-y:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:8px;"></div>
+  <div style="display:flex;gap:8px;">
+    <input id="msg" placeholder="напиши Питону..." autocomplete="off" style="flex:1;padding:10px 14px;border-radius:20px;border:1px solid var(--line);background:#1a1d2b;color:#e5f1ea;font:inherit;outline:none;">
+    <button id="phbtn" title="Отправить фото" style="width:42px;height:42px;min-width:42px;border-radius:50%;border:1px solid #7c4dff;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 0 12px rgba(124,77,255,.35);flex-shrink:0;font-size:20px;">📷</button>
+    <input type="file" id="photo" accept="image/*" style="position:fixed;left:-9999px;top:0;opacity:0;width:1px;height:1px;">
+  </div>
+</div>
+<style>
+.msg { max-width:85%;padding:10px 14px;border-radius:16px;font-size:16px;line-height:1.4;white-space:pre-wrap;word-wrap:break-word; }
+.msg.u { align-self:flex-end;background:#00e676;color:#04140b;border-bottom-right-radius:4px;font-weight:500; }
+.msg.a { align-self:flex-start;background:rgba(26,29,43,.8);color:#e5f1ea;border-bottom-left-radius:4px;backdrop-filter:blur(8px); }
+.msg img.msg-photo { max-width:180px;border-radius:8px;display:block; }
+</style>
+
+<script>
+(function(){
+  const AUTH = (location.search.match(/[?&]token=([^&]+)/)||[])[1]||'';
+  const AUTH_HEADERS = {'Content-Type':'application/json','X-Auth-Token':AUTH};
+  const chat = document.getElementById('chat');
+  const msg = document.getElementById('msg');
+  const photo = document.getElementById('photo');
+  const LS_KEY = 'piton_chat_v1';
+  // локальная копия истории на телефоне — чтобы при перезаходе чат не был пустым
+  function saveLocal() {
+    try {
+      const items = [];
+      chat.querySelectorAll('.msg').forEach(m => items.push({t: m.textContent, c: m.className}));
+      localStorage.setItem(LS_KEY, JSON.stringify(items.slice(-200)));
+    } catch (e) {}
+  }
+  function renderMsgs(items) {
+    items.forEach(m => {
+      const div = document.createElement('div');
+      div.className = m.c;
+      div.textContent = m.t;
+      chat.appendChild(div);
+    });
+    chat.scrollTop = chat.scrollHeight;
+  }
+  function addMsg(text, who) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + who;
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+    saveLocal();
+  }
+  // 1) мгновенно показываем сохранённую на телефоне историю
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_KEY) || '[]');
+    if (Array.isArray(saved) && saved.length) renderMsgs(saved);
+  } catch (e) {}
+  function setEmo(e) {
+    window.__emo = e;
+    const f = document.getElementById('c');
+    if (f && f.contentWindow) {
+      // think держим максимально долго — пока не придёт ответ; остальные на 6с
+      const dur = e === 'think' ? 600000 : 6000;
+      f.contentWindow.postMessage({ emo: e, duration: dur }, '*');
+    }
+  }
+  let idleTimer = null;
+  function autoEmo(text) {
+    let emo = 'talk';
+    if (/грустн|печал|плохо|одинок|скучн|тоск/.test(text)) emo = 'sad';
+    else if (/спасибо|молодец|умниц|красав|класс|люблю|обожаю|хорош|супер|хах|ахах/.test(text)) emo = 'happy';
+    else if (/ого|вау|не может быть|ничего себе|жесть|офигеть/.test(text)) emo = 'surprised';
+    setEmo(emo);
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => setEmo('idle'), 4000);
+  }
+  async function sendMsg() {
+    const text = msg.value.trim();
+    if (!text) return;
+    msg.value = '';
+    addMsg(text, 'u');
+    setEmo('think');
+    try {
+      const r = await fetch('/api/chat', {method:'POST', headers:AUTH_HEADERS, body: JSON.stringify({message:text})});
+      const d = await r.json();
+      if (d.response) { addMsg(d.response, 'a'); if (d.emotion) setEmo(d.emotion); else autoEmo(d.response); }
+    } catch (e) {
+      addMsg('Похоже, соединение оборвалось — догоняю ответ...', 'sys');
+      setEmo('idle');
+      // сервер мог успеть сохранить ответ в историю — подтягиваем сами, без перезахода
+      setTimeout(() => loadHistory(true), 2500);
+      setTimeout(() => loadHistory(true), 7000);
+    }
+  }
+  msg.addEventListener('keydown', e => { if (e.key === 'Enter') sendMsg(); });
+  document.getElementById('phbtn').addEventListener('click', () => photo.click());
+  photo.addEventListener('change', () => {
+    const f = photo.files[0];
+    photo.value = '';
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => {
+      const dataUrl = fr.result;
+      const text = msg.value.trim() || 'Смотри, что у меня есть!';
+      msg.value = '';
+      const img = document.createElement('img');
+      img.src = dataUrl; img.className = 'msg-photo';
+      const div = document.createElement('div');
+      div.className = 'msg u'; div.appendChild(img);
+      chat.appendChild(div); chat.scrollTop = chat.scrollHeight; saveLocal();
+      setEmo('think');
+      fetch('/api/chat', {method:'POST', headers:AUTH_HEADERS, body: JSON.stringify({message:text, image:dataUrl})})
+        .then(r => r.json())
+        .then(d => { if (d.response) { addMsg(d.response, 'a'); if (d.emotion) setEmo(d.emotion); else autoEmo(d.response); } })
+        .catch(() => { addMsg('Похоже, соединение оборвалось — догоняю ответ...', 'sys'); setEmo('idle'); setTimeout(() => loadHistory(true), 2500); setTimeout(() => loadHistory(true), 7000); });
+    };
+    fr.readAsDataURL(f);
+  });
+  // 2) затем синхронизируем с сервером (заменяем локальную копию актуальной)
+  let knownCount = -1;
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+  // WebView/телефон: некоторые браузеры требуют клика юзера, чтобы показать запрос
+  function _askNotif() {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    document.removeEventListener('click', _askNotif);
+  }
+  document.addEventListener('click', _askNotif);
+  function loadHistory(force) {
+    return fetch('/api/history', {headers:{'X-Auth-Token':AUTH}}).then(r => r.json()).then(d => {
+      if (!d.history) return;
+      const oldCount = knownCount;
+      if (force || d.history.length !== oldCount) {
+        chat.innerHTML = '';
+        d.history.forEach((h, i) => {
+          if (h.user) addMsg(h.user, 'u');
+          if (h.ai) {
+            addMsg(h.ai, 'a');
+            // новое сообщение от Питона (инициатор): user пустой, и оно уже не самое первое
+            if (!h.user && i >= oldCount && oldCount > 0 && document.hidden && Notification.permission === 'granted') {
+              try { new Notification('Питон', { body: h.ai.slice(0, 120) }); } catch(e) {}
+            }
+          }
+        });
+        saveLocal();
+      }
+      knownCount = d.history.length;
+    }).catch(() => {});
+  }
+  loadHistory(true);
+  setInterval(() => loadHistory(false), 8000);
+})();
+</script>
+</body>
+</html>

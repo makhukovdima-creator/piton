@@ -1,0 +1,14 @@
+{
+  "light_model": "huihui_ai/qwen3-abliterated:4b-v2-q8_0",
+  "heavy_model": "huihui_ai/qwen3-abliterated:4b-v2-q8_0",
+  "current_model": "huihui_ai/qwen3-abliterated:4b-v2-q8_0",
+  "auto_switch": false,
+  "temperature": 0.9,
+  "num_predict": 10000,
+  "max_history": 100,
+  "system_prompt": "",
+  "auto_save_skills": true,
+  "auto_save_sessions": true,
+  "mini_app_token": "",
+  "model": "huihui_ai/qwen3-abliterated:4b-v2-q8_0"
+}

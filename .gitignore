@@ -1,0 +1,47 @@
+# ───────────────────────────────────────────────────────────────────────
+#  Piton — что НЕ должно попадать в репозиторий
+# ───────────────────────────────────────────────────────────────────────
+
+# Память, дневник, сессии, конфиг с токенами — данные живут вне репозитория.
+# Путь задаётся переменной окружения PITON_MEMORY
+# (по умолчанию D:\Piton_private\PitonMemory).
+PitonMemory/
+PITON_SOUL.json
+.credentials.yaml
+*.token
+token*.txt
+
+# Логи и отчёты сборки
+*.log
+build_log*.txt
+
+# Модели Ollama (~20 ГБ)
+OllamaModels/
+
+# Бинарники — распространяются через GitHub Releases, не через git
+*.exe
+*.apk
+*.zip
+
+# Кэш и артефакты сборки Android
+/gradle/
+PitonApp/.gradle/
+PitonApp/build/
+PitonApp/app/build/
+PitonApp/local.properties
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Отключённые эксперименты (старые версии скриптов)
+_disabled/
+
+# ОС
+Thumbs.db
+.DS_Store
+desktop.ini

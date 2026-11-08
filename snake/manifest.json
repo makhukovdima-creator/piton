@@ -1,0 +1,67 @@
+{
+ "w": 116,
+ "h": 154,
+ "fps": 20,
+ "clips": {
+  "idle": {
+   "file": "idle.png",
+   "frames": 60,
+   "enter": 0,
+   "loop": 60
+  },
+  "think": {
+   "file": "think.png",
+   "frames": 42,
+   "enter": 12,
+   "loop": 30
+  },
+  "talk": {
+   "file": "talk.png",
+   "frames": 52,
+   "enter": 12,
+   "loop": 40
+  },
+  "happy": {
+   "file": "happy.png",
+   "frames": 42,
+   "enter": 12,
+   "loop": 30
+  },
+  "sad": {
+   "file": "sad.png",
+   "frames": 42,
+   "enter": 12,
+   "loop": 30
+  },
+  "shy": {
+   "file": "shy.png",
+   "frames": 42,
+   "enter": 12,
+   "loop": 30
+  },
+  "surprised": {
+   "file": "surprised.png",
+   "frames": 42,
+   "enter": 12,
+   "loop": 30
+  }
+ },
+ "look": {
+  "file": "look.png",
+  "frames": 15,
+  "cols": 5,
+  "rows": 3,
+  "xs": [
+   -1,
+   -0.5,
+   0,
+   0.5,
+   1
+  ],
+  "ys": [
+   0.6,
+   0,
+   -0.6
+  ]
+ }
+}
