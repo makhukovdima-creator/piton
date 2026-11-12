@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Синтаксис Python
+        run: python -m compileall -q piton_*.py ngrok_watchdog.py
+
+      - name: Пример конфига — валидный JSON
+        run: python -c "import json; json.load(open('config.example.json', encoding='utf-8'))"
+
+      - name: В коде нет секретов
+        run: |
+          if grep -rInE 'ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}' \
+               --exclude-dir=.git --exclude-dir=screenshots .; then
+            echo "::error::Похоже, в репозиторий попал токен"
+            exit 1
+          fi
